@@ -114,7 +114,7 @@ func asError(err error, dest **Error) bool {
 }
 
 func (v *Volume) control(ctx context.Context, method, route string, body any) (map[string]any, error) {
-	resp, err := do(ctx, v.http, v.settings, request{method: method, url: v.settings.Master + route, json: body})
+	resp, err := do(ctx, v.http, v.settings, request{control: true, method: method, url: v.settings.Master + route, json: body})
 	if err != nil {
 		return nil, err
 	}

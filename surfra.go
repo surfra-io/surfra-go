@@ -105,6 +105,13 @@ func (s Settings) Credential() (string, error) {
 	return "", ErrNoCredential
 }
 
+// ControlCredential is the credential for control-plane calls: an explicit key, SURFRA_API_KEY, then the
+// saved login. Never the volumes token, which only the volumes service accepts.
+func (s Settings) ControlCredential() (string, error) {
+	s.TokenFile, s.ReplicaToken = "", ""
+	return s.Credential()
+}
+
 // Error is Surfra refusing a request: Status is the HTTP code, Detail the reason it gave.
 type Error struct {
 	Status int
@@ -140,16 +147,21 @@ func errorFrom(resp *http.Response) error {
 }
 
 type request struct {
-	method string
-	url    string
-	body   []byte
-	json   any
-	query  url.Values
-	header http.Header
+	control bool // a control-plane call: never sends the volumes token
+	method  string
+	url     string
+	body    []byte
+	json    any
+	query   url.Values
+	header  http.Header
 }
 
 func send(ctx context.Context, client *http.Client, s Settings, r request) (*http.Response, error) {
-	token, err := s.Credential()
+	credential := s.Credential
+	if r.control {
+		credential = s.ControlCredential
+	}
+	token, err := credential()
 	if err != nil {
 		return nil, err
 	}

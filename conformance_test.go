@@ -378,6 +378,109 @@ func TestConformance(t *testing.T) {
 				t.Fatalf("a failed call returned %v", err)
 			}
 		},
+		"v15_write_and_read_helpers": func(t *testing.T) {
+			f := start(t)
+			weights := f.volume("weights")
+			_, err := weights.WriteFile(ctx, "bytes.bin", []byte{0, 1, 'r', 'a', 'w'})
+			check(t, err)
+			back, err := weights.ReadFile(ctx, "bytes.bin")
+			check(t, err)
+			if !bytes.Equal(back, []byte{0, 1, 'r', 'a', 'w'}) {
+				t.Fatalf("read %v", back)
+			}
+		},
+		"c01_control_plane_calls_skip_the_volumes_token": func(t *testing.T) {
+			f := start(t)
+			token := filepath.Join(t.TempDir(), "token")
+			check(t, os.WriteFile(token, []byte("aaa.bbb.ccc"), 0o600))
+			s := f.settings()
+			s.TokenFile = token
+			weights := NewVolumeWith("weights", s)
+			_, err := weights.Create(ctx)
+			check(t, err)
+			_, err = weights.Ls(ctx, "", false)
+			check(t, err)
+			_, err = NewClientWith(s).Run(ctx, "embed", nil)
+			check(t, err)
+			sent := map[string]string{}
+			for _, item := range f.requests() {
+				sent[item.Path] = item.Auth
+			}
+			if sent["/v1/volumes"] != "Bearer sfk_test" || sent["/v1/transactions"] != "Bearer sfk_test" || sent["/v1/weights/list"] != "Bearer aaa.bbb.ccc" {
+				t.Fatalf("sent %v", sent)
+			}
+		},
+		"a03_app_deploy_sends_the_spec": func(t *testing.T) {
+			f := start(t)
+			saved, err := NewAppWith("embed", f.settings()).Deploy(ctx, AppSpec{Image: "ghcr.io/acme/embed:1", Entrypoint: "app.py", Autoscale: map[string]any{"max_replicas": 2}, Runtime: map[string]any{"engine": "python"}})
+			check(t, err)
+			autoscale, _ := json.Marshal(saved["autoscale"])
+			if saved["name"] != "embed" || !strings.HasPrefix(fmt.Sprint(saved["id"]), "sfa_") || saved["image"] != "ghcr.io/acme/embed:1" || string(autoscale) != `{"max_replicas":2}` {
+				t.Fatalf("saved %v", saved)
+			}
+			found := false
+			for _, item := range f.requests() {
+				found = found || (item.Method == "PUT" && item.Path == "/v1/apps/embed")
+			}
+			if !found {
+				t.Fatal("no PUT /v1/apps/embed")
+			}
+		},
+		"a04_app_run_and_volumes": func(t *testing.T) {
+			f := start(t)
+			app := NewAppWith("embed", f.settings())
+			out, err := app.Run(ctx, map[string]any{"x": 1})
+			check(t, err)
+			if got, _ := json.Marshal(out); string(got) != `{"app":"embed","echo":{"x":1}}` {
+				t.Fatalf("output %s", got)
+			}
+			_, err = app.SetVolumes(ctx, []string{"weights:r"})
+			check(t, err)
+			grants, err := app.Volumes(ctx)
+			check(t, err)
+			if len(grants) != 1 || grants[0] != (VolumeGrant{Volume: "weights", Mode: "r"}) {
+				t.Fatalf("volumes %v", grants)
+			}
+		},
+		"a05_a_rate_limited_submit_waits_and_succeeds": func(t *testing.T) {
+			f := start(t)
+			out, err := NewClientWith(f.settings()).Run(ctx, "busy", map[string]any{"n": 1})
+			check(t, err)
+			if got, _ := json.Marshal(out); string(got) != `{"app":"busy","echo":{"n":1}}` {
+				t.Fatalf("output %s", got)
+			}
+			posts := 0
+			for _, item := range f.requests() {
+				if item.Path == "/v1/transactions" {
+					posts++
+				}
+			}
+			if posts != 2 {
+				t.Fatalf("posted %d times", posts)
+			}
+		},
+		"w01_workflow_run_returns_each_stage": func(t *testing.T) {
+			f := start(t)
+			out, err := NewWorkflowWith("pipeline", f.settings()).Run(ctx, map[string]any{"q": "hi"})
+			check(t, err)
+			if got, _ := json.Marshal(out); string(got) != `{"a":{"app":"embed","echo":{"q":"hi"}},"b":{"app":"rerank","echo":{}}}` {
+				t.Fatalf("output %s", got)
+			}
+		},
+		"j02_job_logs_oldest_first": func(t *testing.T) {
+			f := start(t)
+			job, err := NewClientWith(f.settings()).SubmitJob(ctx, JobSpec{Entrypoint: "echo hi", Image: "img", Providers: []map[string]any{{"provider": "local"}}})
+			check(t, err)
+			lines, err := job.Logs(ctx, "")
+			check(t, err)
+			var got []string
+			for _, line := range lines {
+				got = append(got, line.M)
+			}
+			if strings.Join(got, ",") != "line 0,line 1,line 2" {
+				t.Fatalf("logs %v", got)
+			}
+		},
 		"j01_job_with_volumes_finishes": func(t *testing.T) {
 			f := start(t)
 			job, err := NewClientWith(f.settings()).SubmitJob(ctx, JobSpec{Entrypoint: "python train.py", Image: "img", Providers: []map[string]any{{"provider": "local"}}, Volumes: []string{NewVolume("weights").Grant(Read)}})

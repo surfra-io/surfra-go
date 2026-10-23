@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,7 +25,7 @@ func NewClientWith(s Settings) *Client {
 }
 
 func (c *Client) call(ctx context.Context, method, route string, body any, dest any) error {
-	resp, err := do(ctx, c.http, c.settings, request{method: method, url: c.settings.Master + route, json: body})
+	resp, err := do(ctx, c.http, c.settings, request{control: true, method: method, url: c.settings.Master + route, json: body})
 	if err != nil {
 		return err
 	}
@@ -43,13 +44,177 @@ func (c *Client) Enqueue(ctx context.Context, app string, input any) (*Call, err
 	if input == nil {
 		input = map[string]any{}
 	}
-	body := map[string]any{"stages": []map[string]any{{"name": "call", "app_name": app, "depends_on": []string{}, "input": input}}, "metadata": map[string]any{}}
-	var view map[string]any
-	if err := c.call(ctx, http.MethodPost, "/v1/transactions", body, &view); err != nil {
+	view, err := c.Submit(ctx, []map[string]any{{"name": "call", "app_name": app, "depends_on": []string{}, "input": input}}, nil)
+	if err != nil {
 		return nil, err
 	}
 	id, _ := view["id"].(string)
 	return &Call{ID: id, View: view, client: c}, nil
+}
+
+const rateRetries = 5
+
+// Submit starts a transaction. Over the organization's request rate, it waits as Surfra asks, up to five times.
+func (c *Client) Submit(ctx context.Context, stages []map[string]any, metadata map[string]any) (map[string]any, error) {
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	body := map[string]any{"stages": stages, "metadata": metadata}
+	for attempt := 0; ; attempt++ {
+		resp, err := send(ctx, c.http, c.settings, request{control: true, method: http.MethodPost, url: c.settings.Master + "/v1/transactions", json: body})
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < rateRetries {
+			resp.Body.Close()
+			wait, err := strconv.ParseFloat(resp.Header.Get("Retry-After"), 64)
+			if err != nil {
+				wait = 1
+			}
+			if err := sleep(ctx, time.Duration(max(1, min(60, wait))*float64(time.Second))); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			defer resp.Body.Close()
+			return nil, errorFrom(resp)
+		}
+		var view map[string]any
+		return view, decode(resp, &view)
+	}
+}
+
+// App is a deployed app by name. No request is made until it is used.
+type App struct {
+	Name   string
+	client *Client
+}
+
+// NewApp is an app using credentials and URLs from the environment.
+func NewApp(name string) *App { return &App{Name: name, client: NewClient()} }
+
+// NewAppWith is an app with explicit settings.
+func NewAppWith(name string, s Settings) *App { return &App{Name: name, client: NewClientWith(s)} }
+
+// AppSpec is what an app runs. Runtime is {"engine": "python"} or {"engine": "http", "port": 8000}.
+type AppSpec struct {
+	Image      string            `json:"image"`
+	Entrypoint string            `json:"entrypoint"`
+	Env        map[string]string `json:"env"`
+	Autoscale  map[string]any    `json:"autoscale"` // machine rows, replicas and scaling, as in the docs' autoscale reference
+	Runtime    map[string]any    `json:"runtime,omitempty"`
+	Registry   map[string]any    `json:"registry,omitempty"`
+}
+
+func (a *App) route(rest string) string { return "/v1/apps/" + url.PathEscape(a.Name) + rest }
+
+// Deploy creates the app, or updates the app with this name, and returns the saved app with its sfa_ id.
+func (a *App) Deploy(ctx context.Context, spec AppSpec) (map[string]any, error) {
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	if spec.Autoscale == nil {
+		spec.Autoscale = map[string]any{}
+	}
+	var saved map[string]any
+	return saved, a.client.call(ctx, http.MethodPut, a.route(""), spec, &saved)
+}
+
+// Info is the saved app: image, entrypoint, runtime and autoscale.
+func (a *App) Info(ctx context.Context) (map[string]any, error) {
+	var saved map[string]any
+	return saved, a.client.call(ctx, http.MethodGet, a.route(""), nil, &saved)
+}
+
+// Enqueue queues one request and returns it before the app finishes.
+func (a *App) Enqueue(ctx context.Context, input any) (*Call, error) {
+	return a.client.Enqueue(ctx, a.Name, input)
+}
+
+// Run calls the app and waits for its output. Bound the wait with ctx.
+func (a *App) Run(ctx context.Context, input any) (any, error) {
+	return a.client.Run(ctx, a.Name, input)
+}
+
+// VolumeGrant is one volume an app may reach.
+type VolumeGrant struct {
+	Volume string `json:"volume"`
+	Mode   string `json:"mode"`
+}
+
+// Volumes lists the volumes this app's replicas may reach.
+func (a *App) Volumes(ctx context.Context) ([]VolumeGrant, error) {
+	var out struct {
+		Volumes []VolumeGrant `json:"volumes"`
+	}
+	return out.Volumes, a.client.call(ctx, http.MethodGet, a.route("/volumes"), nil, &out)
+}
+
+// SetVolumes replaces the app's volumes, such as "weights:r" and "outputs:rw".
+func (a *App) SetVolumes(ctx context.Context, volumes []string) ([]VolumeGrant, error) {
+	var out struct {
+		Volumes []VolumeGrant `json:"volumes"`
+	}
+	return out.Volumes, a.client.call(ctx, http.MethodPut, a.route("/volumes"), map[string]any{"volumes": volumes}, &out)
+}
+
+// Workflow is a saved workflow by name.
+type Workflow struct {
+	Name   string
+	client *Client
+}
+
+// NewWorkflow is a workflow using credentials and URLs from the environment.
+func NewWorkflow(name string) *Workflow { return &Workflow{Name: name, client: NewClient()} }
+
+// NewWorkflowWith is a workflow with explicit settings.
+func NewWorkflowWith(name string, s Settings) *Workflow {
+	return &Workflow{Name: name, client: NewClientWith(s)}
+}
+
+// Enqueue starts one run. Stages with no dependencies receive input.
+func (w *Workflow) Enqueue(ctx context.Context, input any) (*Call, error) {
+	if input == nil {
+		input = map[string]any{}
+	}
+	var saved struct {
+		Stages []struct {
+			Name    string   `json:"name"`
+			App     string   `json:"app"`
+			Depends []string `json:"depends"`
+		} `json:"stages"`
+	}
+	if err := w.client.call(ctx, http.MethodGet, "/v1/workflows/"+url.PathEscape(w.Name), nil, &saved); err != nil {
+		return nil, err
+	}
+	stages := make([]map[string]any, 0, len(saved.Stages))
+	for _, row := range saved.Stages {
+		stageInput := input
+		if len(row.Depends) > 0 {
+			stageInput = map[string]any{}
+		}
+		depends := row.Depends
+		if depends == nil {
+			depends = []string{}
+		}
+		stages = append(stages, map[string]any{"name": row.Name, "app_name": row.App, "depends_on": depends, "input": stageInput})
+	}
+	view, err := w.client.Submit(ctx, stages, map[string]any{"workflow": w.Name})
+	if err != nil {
+		return nil, err
+	}
+	id, _ := view["id"].(string)
+	return &Call{ID: id, View: view, client: w.client}, nil
+}
+
+// Run starts one run and waits. It returns {stage name: output}, or the output for a single stage.
+func (w *Workflow) Run(ctx context.Context, input any) (any, error) {
+	call, err := w.Enqueue(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return call.Result(ctx)
 }
 
 // Run calls an app and waits for its output. Bound the wait with ctx.
@@ -175,6 +340,37 @@ func (j *Job) Stop(ctx context.Context) (map[string]any, error) {
 	}
 	j.View = view
 	return view, nil
+}
+
+// LogLine is one line of a job's output. S is out, err, or sys for Surfra's own lines.
+type LogLine struct {
+	T string `json:"t"`
+	S string `json:"s"`
+	M string `json:"m"`
+}
+
+// Logs returns the job's lines after `after` (a timestamp from an earlier line), oldest first.
+func (j *Job) Logs(ctx context.Context, after string) ([]LogLine, error) {
+	var out []LogLine
+	for {
+		query := url.Values{"limit": {"1000"}, "order": {"asc"}}
+		if after != "" {
+			query.Set("after", after)
+		}
+		var page struct {
+			Lines []LogLine `json:"lines"`
+		}
+		if err := j.client.call(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(j.ID)+"/logs?"+query.Encode(), nil, &page); err != nil {
+			return out, err
+		}
+		out = append(out, page.Lines...)
+		if len(page.Lines) > 0 {
+			after = page.Lines[len(page.Lines)-1].T
+		}
+		if len(page.Lines) < 1000 {
+			return out, nil
+		}
+	}
 }
 
 // Wait polls until the job ends: succeeded, failed, stopped or lost. Bound the wait with ctx.
