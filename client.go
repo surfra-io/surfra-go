@@ -39,6 +39,12 @@ type Call struct {
 	client *Client
 }
 
+// NewCall tracks a call from the view Submit returned.
+func NewCall(c *Client, view map[string]any) *Call {
+	id, _ := view["id"].(string)
+	return &Call{ID: id, View: view, client: c}
+}
+
 // Enqueue queues one call to an app and returns it before the app finishes.
 func (c *Client) Enqueue(ctx context.Context, app string, input any) (*Call, error) {
 	if input == nil {

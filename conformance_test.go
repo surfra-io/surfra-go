@@ -361,6 +361,20 @@ func TestConformance(t *testing.T) {
 				t.Fatalf("output %s", got)
 			}
 		},
+		"a06_submit_a_graph_and_wait": func(t *testing.T) {
+			f := start(t)
+			client := NewClientWith(f.settings())
+			view, err := client.Submit(ctx, []map[string]any{
+				{"name": "a", "app_name": "embed", "depends_on": []string{}, "input": map[string]any{"n": 1}},
+				{"name": "b", "app_name": "rerank", "depends_on": []string{"a"}, "input": map[string]any{}},
+			}, nil)
+			check(t, err)
+			out, err := NewCall(client, view).Result(ctx)
+			check(t, err)
+			if got, _ := json.Marshal(out); string(got) != `{"a":{"app":"embed","echo":{"n":1}},"b":{"app":"rerank","echo":{}}}` {
+				t.Fatalf("output %s", got)
+			}
+		},
 		"a02_enqueue_then_result": func(t *testing.T) {
 			f := start(t)
 			client := NewClientWith(f.settings())
