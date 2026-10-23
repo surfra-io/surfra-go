@@ -467,6 +467,17 @@ func TestConformance(t *testing.T) {
 				t.Fatalf("output %s", got)
 			}
 		},
+		"w02_workflow_deploy_saves_stages": func(t *testing.T) {
+			f := start(t)
+			flow := NewWorkflowWith("solo", f.settings())
+			_, err := flow.Deploy(ctx, []Stage{{Name: "only", App: "embed"}})
+			check(t, err)
+			out, err := flow.Run(ctx, map[string]any{"q": "hi"})
+			check(t, err)
+			if got, _ := json.Marshal(out); string(got) != `{"app":"embed","echo":{"q":"hi"}}` {
+				t.Fatalf("output %s", got)
+			}
+		},
 		"j02_job_logs_oldest_first": func(t *testing.T) {
 			f := start(t)
 			job, err := NewClientWith(f.settings()).SubmitJob(ctx, JobSpec{Entrypoint: "echo hi", Image: "img", Providers: []map[string]any{{"provider": "local"}}})

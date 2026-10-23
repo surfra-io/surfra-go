@@ -173,6 +173,24 @@ func NewWorkflowWith(name string, s Settings) *Workflow {
 	return &Workflow{Name: name, client: NewClientWith(s)}
 }
 
+// Stage is one step of a workflow: the app it calls and the stages it waits for.
+type Stage struct {
+	Name    string   `json:"name"`
+	App     string   `json:"app"`
+	Depends []string `json:"depends"`
+}
+
+// Deploy saves the stages.
+func (w *Workflow) Deploy(ctx context.Context, stages []Stage) (map[string]any, error) {
+	for i := range stages {
+		if stages[i].Depends == nil {
+			stages[i].Depends = []string{}
+		}
+	}
+	var saved map[string]any
+	return saved, w.client.call(ctx, http.MethodPut, "/v1/workflows/"+url.PathEscape(w.Name), map[string]any{"stages": stages}, &saved)
+}
+
 // Enqueue starts one run. Stages with no dependencies receive input.
 func (w *Workflow) Enqueue(ctx context.Context, input any) (*Call, error) {
 	if input == nil {
