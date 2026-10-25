@@ -7,10 +7,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Client is the control plane: call apps and run jobs.
+// Client is the control plane: call apps and run jobs. It holds no mutable state, so one Client is safe
+// to share across goroutines.
 type Client struct {
 	settings Settings
 	http     *http.Client
@@ -21,7 +23,19 @@ func NewClient() *Client { return NewClientWith(SettingsFromEnv()) }
 
 // NewClientWith is a client with explicit settings.
 func NewClientWith(s Settings) *Client {
-	return &Client{settings: s, http: &http.Client{Timeout: 60 * time.Second}}
+	h := s.HTTPClient
+	if h == nil {
+		h = &http.Client{Timeout: 60 * time.Second}
+	}
+	return &Client{settings: s, http: h}
+}
+
+// WithHTTPClient is a copy of this client that sends every request with h, such as one with a proxy,
+// custom TLS or tracing. Per-request deadlines still come from ctx. The original client is unchanged.
+func (c *Client) WithHTTPClient(h *http.Client) *Client {
+	s := c.settings
+	s.HTTPClient = h
+	return NewClientWith(s)
 }
 
 func (c *Client) call(ctx context.Context, method, route string, body any, dest any) error {
@@ -32,11 +46,28 @@ func (c *Client) call(ctx context.Context, method, route string, body any, dest 
 	return decode(resp, dest)
 }
 
-// Call is one call to an app.
+// Call is one call to an app. It is safe to share across goroutines: Get, Result and LastView may run at
+// once. View is the last view fetched; it is kept for compatibility and is written under the Call's lock,
+// so read it directly only when no other goroutine is using the Call, and use LastView otherwise.
+// Views are replaced, never modified, so a map returned by LastView or Get stays as it was.
 type Call struct {
 	ID     string
 	View   map[string]any
+	mu     sync.RWMutex
 	client *Client
+}
+
+// LastView is the last view fetched, without a request. Safe to call from any goroutine.
+func (call *Call) LastView() map[string]any {
+	call.mu.RLock()
+	defer call.mu.RUnlock()
+	return call.View
+}
+
+func (call *Call) setView(view map[string]any) {
+	call.mu.Lock()
+	call.View = view
+	call.mu.Unlock()
 }
 
 // NewCall tracks a call from the view Submit returned.
@@ -45,12 +76,23 @@ func NewCall(c *Client, view map[string]any) *Call {
 	return &Call{ID: id, View: view, client: c}
 }
 
+// EnqueueOptions are optional settings for EnqueueWith.
+type EnqueueOptions struct {
+	// CallbackURL is sent as callback_url: Surfra stores it with the call; delivery is planned.
+	CallbackURL string
+}
+
 // Enqueue queues one call to an app and returns it before the app finishes.
 func (c *Client) Enqueue(ctx context.Context, app string, input any) (*Call, error) {
+	return c.EnqueueWith(ctx, app, input, EnqueueOptions{})
+}
+
+// EnqueueWith is Enqueue with options, such as a callback URL.
+func (c *Client) EnqueueWith(ctx context.Context, app string, input any, opts EnqueueOptions) (*Call, error) {
 	if input == nil {
 		input = map[string]any{}
 	}
-	view, err := c.Submit(ctx, []map[string]any{{"name": "call", "app_name": app, "depends_on": []string{}, "input": input}}, nil)
+	view, err := c.SubmitWith(ctx, []map[string]any{{"name": "call", "app_name": app, "depends_on": []string{}, "input": input}}, SubmitOptions{CallbackURL: opts.CallbackURL})
 	if err != nil {
 		return nil, err
 	}
@@ -60,12 +102,28 @@ func (c *Client) Enqueue(ctx context.Context, app string, input any) (*Call, err
 
 const rateRetries = 5
 
+// SubmitOptions are optional settings for SubmitWith.
+type SubmitOptions struct {
+	Metadata map[string]any
+	// CallbackURL is sent as callback_url: Surfra stores it with the transaction; delivery is planned.
+	CallbackURL string
+}
+
 // Submit starts a transaction. Over the organization's request rate, it waits as Surfra asks, up to five times.
 func (c *Client) Submit(ctx context.Context, stages []map[string]any, metadata map[string]any) (map[string]any, error) {
+	return c.SubmitWith(ctx, stages, SubmitOptions{Metadata: metadata})
+}
+
+// SubmitWith is Submit with options, such as a callback URL.
+func (c *Client) SubmitWith(ctx context.Context, stages []map[string]any, opts SubmitOptions) (map[string]any, error) {
+	metadata := opts.Metadata
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
 	body := map[string]any{"stages": stages, "metadata": metadata}
+	if opts.CallbackURL != "" {
+		body["callback_url"] = opts.CallbackURL
+	}
 	for attempt := 0; ; attempt++ {
 		resp, err := send(ctx, c.http, c.settings, request{control: true, method: http.MethodPost, url: c.settings.Master + "/v1/transactions", json: body})
 		if err != nil {
@@ -136,6 +194,11 @@ func (a *App) Info(ctx context.Context) (map[string]any, error) {
 // Enqueue queues one request and returns it before the app finishes.
 func (a *App) Enqueue(ctx context.Context, input any) (*Call, error) {
 	return a.client.Enqueue(ctx, a.Name, input)
+}
+
+// EnqueueWith is Enqueue with options, such as a callback URL.
+func (a *App) EnqueueWith(ctx context.Context, input any, opts EnqueueOptions) (*Call, error) {
+	return a.client.EnqueueWith(ctx, a.Name, input, opts)
 }
 
 // Run calls the app and waits for its output. Bound the wait with ctx.
@@ -256,15 +319,17 @@ func (call *Call) Get(ctx context.Context) (map[string]any, error) {
 	if err := call.client.call(ctx, http.MethodGet, "/v1/transactions/"+url.PathEscape(call.ID), nil, &view); err != nil {
 		return nil, err
 	}
-	call.View = view
+	call.setView(view)
 	return view, nil
 }
 
 // Result waits for the call and returns its output. A failed call returns each stage's error.
 func (call *Call) Result(ctx context.Context) (any, error) {
 	wait := 100 * time.Millisecond
+	var view map[string]any
 	for {
-		view, err := call.Get(ctx)
+		var err error
+		view, err = call.Get(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -277,8 +342,8 @@ func (call *Call) Result(ctx context.Context) (any, error) {
 		}
 		wait = min(wait*2, 2*time.Second)
 	}
-	stages, _ := call.View["stages"].([]any)
-	if call.View["status"] != "succeeded" {
+	stages, _ := view["stages"].([]any)
+	if view["status"] != "succeeded" {
 		var reasons []string
 		for _, raw := range stages {
 			stage, _ := raw.(map[string]any)
@@ -316,11 +381,27 @@ type JobSpec struct {
 	DeadlineSec int               `json:"deadline_sec,omitempty"`
 }
 
-// Job is one job.
+// Job is one job. It is safe to share across goroutines: Get, Wait, Stop, Status and LastView may run at
+// once. View is the last view fetched; it is kept for compatibility and is written under the Job's lock,
+// so read it directly only when no other goroutine is using the Job, and use LastView otherwise.
 type Job struct {
 	ID     string
 	View   map[string]any
+	mu     sync.RWMutex
 	client *Client
+}
+
+// LastView is the last view fetched, without a request. Safe to call from any goroutine.
+func (j *Job) LastView() map[string]any {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.View
+}
+
+func (j *Job) setView(view map[string]any) {
+	j.mu.Lock()
+	j.View = view
+	j.mu.Unlock()
 }
 
 // SubmitJob runs a command once on one machine.
@@ -342,7 +423,7 @@ func (c *Client) Job(ctx context.Context, id string) (*Job, error) {
 
 // Status is the job's last known status.
 func (j *Job) Status() string {
-	status, _ := j.View["status"].(string)
+	status, _ := j.LastView()["status"].(string)
 	return status
 }
 
@@ -352,7 +433,7 @@ func (j *Job) Get(ctx context.Context) (map[string]any, error) {
 	if err := j.client.call(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(j.ID), nil, &view); err != nil {
 		return nil, err
 	}
-	j.View = view
+	j.setView(view)
 	return view, nil
 }
 
@@ -362,7 +443,7 @@ func (j *Job) Stop(ctx context.Context) (map[string]any, error) {
 	if err := j.client.call(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(j.ID)+"/stop", map[string]any{}, &view); err != nil {
 		return nil, err
 	}
-	j.View = view
+	j.setView(view)
 	return view, nil
 }
 
@@ -404,12 +485,13 @@ func (j *Job) Wait(ctx context.Context, interval time.Duration) (map[string]any,
 		if err != nil {
 			return nil, err
 		}
-		switch j.Status() {
+		status, _ := view["status"].(string)
+		switch status {
 		case "succeeded", "failed", "stopped", "lost":
 			return view, nil
 		}
 		if err := sleep(ctx, interval); err != nil {
-			return nil, fmt.Errorf("job %s is still %s: %w", j.ID, j.Status(), err)
+			return nil, fmt.Errorf("job %s is still %s: %w", j.ID, status, err)
 		}
 	}
 }

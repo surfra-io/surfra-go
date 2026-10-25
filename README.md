@@ -44,6 +44,30 @@ view, err := job.Wait(ctx, 10*time.Second)
 
 Bound waits with the context, such as `context.WithTimeout`.
 
+To be told when a call finishes, pass a callback URL. Surfra stores it with the call; delivery is planned.
+
+```go
+call, err := client.EnqueueWith(ctx, "embed", input, surfra.EnqueueOptions{CallbackURL: "https://example.com/hook"})
+```
+
+## Goroutines and HTTP
+
+Every call is a blocking call that takes a `ctx`; run calls concurrently with `go`. `Client` and `Volume`
+are safe to share. `Call` and `Job` are too: `Get`, `Result`, `Wait` and `Stop` may run from many
+goroutines at once. Read the last view with `LastView()` rather than the `View` field when the handle is
+shared.
+
+To use your own `*http.Client` (proxy, TLS, tracing, timeouts), set `Settings.HTTPClient` or:
+
+```go
+client := surfra.NewClient().WithHTTPClient(httpClient)
+weights := surfra.NewVolume("weights").WithHTTPClient(httpClient)
+```
+
+The SDK's own client caps a control-plane request at 60 s and a volume request at 30 min. A volume stream
+(`Open`, and the downloads `Local` and `Download` make) under a ctx with a deadline is bounded by that
+deadline instead, so set one for very large files.
+
 ## Credentials
 
 Inside a Surfra app or job nothing needs setting: `SURFRA_VOLUMES_URL` is a local proxy that adds the

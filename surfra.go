@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,10 +39,15 @@ type Settings struct {
 	VolumesURL   string // SURFRA_VOLUMES_URL, default https://volumes.surfra.io
 	Cache        string // SURFRA_VOLUME_CACHE, default <temp dir>/surfra
 	PartBytes    int64  // SURFRA_VOLUMES_PART_BYTES, default 64 MiB: larger files upload in parts
-	TokenFile    string // SURFRA_VOLUMES_TOKEN_FILE, read on every request
+	TokenFile    string // SURFRA_VOLUMES_TOKEN_FILE, re-read whenever the file changes
 	EnvAPIKey    string // SURFRA_API_KEY
 	ReplicaToken string // SURFRA_REPLICA_TOKEN
 	LoginFile    string // the session `surfra login` saved, ~/.surfra/config.json
+
+	// HTTPClient, when set, sends every request instead of the SDK's own client (60 s timeout for the
+	// control plane, 30 min for volumes). Use it for proxies, custom TLS, tracing or your own timeouts.
+	// It is shared, so it must be safe for concurrent use, as *http.Client is.
+	HTTPClient *http.Client
 }
 
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
@@ -82,7 +88,7 @@ func (s Settings) Credential() (string, error) {
 		return s.APIKey, nil
 	}
 	if s.TokenFile != "" {
-		if data, err := os.ReadFile(s.TokenFile); err == nil && strings.TrimSpace(string(data)) != "" {
+		if data, err := readCached(s.TokenFile); err == nil && strings.TrimSpace(string(data)) != "" {
 			return strings.TrimSpace(string(data)), nil
 		}
 	}
@@ -93,7 +99,7 @@ func (s Settings) Credential() (string, error) {
 		return s.ReplicaToken, nil
 	}
 	if s.LoginFile != "" {
-		if data, err := os.ReadFile(s.LoginFile); err == nil {
+		if data, err := readCached(s.LoginFile); err == nil {
 			var saved struct {
 				Token string `json:"token"`
 			}
@@ -103,6 +109,38 @@ func (s Settings) Credential() (string, error) {
 		}
 	}
 	return "", ErrNoCredential
+}
+
+type cachedFile struct {
+	modTime time.Time
+	size    int64
+	data    []byte
+}
+
+// files caches credential files by path, so a request costs a stat rather than a read.
+var files sync.Map // path -> cachedFile
+
+// readCached returns the file's contents, reading it again only when its modification time or size
+// changed. It follows symlinks, so a rotated token behind a swapped link is picked up.
+func readCached(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		files.Delete(path)
+		return nil, err
+	}
+	if hit, ok := files.Load(path); ok {
+		c := hit.(cachedFile)
+		if c.modTime.Equal(info.ModTime()) && c.size == info.Size() {
+			return c.data, nil
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		files.Delete(path)
+		return nil, err
+	}
+	files.Store(path, cachedFile{modTime: info.ModTime(), size: info.Size(), data: data})
+	return data, nil
 }
 
 // ControlCredential is the credential for control-plane calls: an explicit key, SURFRA_API_KEY, then the

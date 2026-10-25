@@ -55,6 +55,7 @@ type Volume struct {
 	Name     string
 	settings Settings
 	http     *http.Client
+	stream   *http.Client // the default client without its total timeout, for Open under a ctx deadline; nil when injected
 	mu       sync.Mutex
 	synced   map[string]Mode
 }
@@ -63,8 +64,26 @@ type Volume struct {
 func NewVolume(name string) *Volume { return NewVolumeWith(name, SettingsFromEnv()) }
 
 // NewVolumeWith is a volume with explicit settings.
+//
+// Without Settings.HTTPClient, each request is capped at 30 minutes, except that a stream from Open (and
+// the downloads Local and Download make) under a ctx with a deadline is bounded by that deadline instead,
+// so a long download is not cut at 30 minutes when the caller allows longer.
 func NewVolumeWith(name string, s Settings) *Volume {
-	return &Volume{Name: name, settings: s, http: &http.Client{Timeout: 30 * time.Minute}, synced: map[string]Mode{}}
+	v := &Volume{Name: name, settings: s, http: s.HTTPClient, synced: map[string]Mode{}}
+	if v.http == nil {
+		v.http = &http.Client{Timeout: 30 * time.Minute}
+		v.stream = &http.Client{}
+	}
+	return v
+}
+
+// WithHTTPClient is a new handle on the same volume that sends every request with h, such as one with a
+// proxy, custom TLS or tracing. h's own Timeout, if any, applies to every request including streams.
+// The new handle starts with its own sync bookkeeping; the original is unchanged.
+func (v *Volume) WithHTTPClient(h *http.Client) *Volume {
+	s := v.settings
+	s.HTTPClient = h
+	return NewVolumeWith(v.Name, s)
 }
 
 // Grant is a grant such as "weights:r", for jobs and apps.
@@ -86,7 +105,11 @@ func (v *Volume) url(route string) string {
 
 // call talks to the volumes service. With create, a write to a volume that does not exist yet creates it first.
 func (v *Volume) call(ctx context.Context, r request, create bool) (*http.Response, error) {
-	resp, err := send(ctx, v.http, v.settings, r)
+	return v.callWith(ctx, v.http, r, create)
+}
+
+func (v *Volume) callWith(ctx context.Context, client *http.Client, r request, create bool) (*http.Response, error) {
+	resp, err := send(ctx, client, v.settings, r)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +121,7 @@ func (v *Volume) call(ctx context.Context, r request, create bool) (*http.Respon
 			if _, err := v.Create(ctx); err != nil {
 				return nil, err
 			}
-			return do(ctx, v.http, v.settings, r)
+			return do(ctx, client, v.settings, r)
 		}
 		return nil, failure
 	}
@@ -228,9 +251,14 @@ func (v *Volume) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// Open streams one file. Close the reader when done.
+// Open streams one file. Close the reader when done. With the SDK's own HTTP client, a ctx deadline
+// bounds the whole stream in place of the 30-minute cap; without a deadline the cap applies.
 func (v *Volume) Open(ctx context.Context, path string) (io.ReadCloser, error) {
-	resp, err := v.call(ctx, request{method: http.MethodGet, url: v.url("files/" + encodePath(path))}, false)
+	client := v.http
+	if _, ok := ctx.Deadline(); ok && v.stream != nil {
+		client = v.stream
+	}
+	resp, err := v.callWith(ctx, client, request{method: http.MethodGet, url: v.url("files/" + encodePath(path))}, false)
 	if err != nil {
 		return nil, err
 	}
