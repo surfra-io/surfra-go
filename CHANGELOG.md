@@ -8,7 +8,8 @@ All notable changes to this project are documented here. The format follows
 ### Added
 - `Settings.HTTPClient`, `Client.WithHTTPClient` and `Volume.WithHTTPClient` to send requests with your own `*http.Client`.
 - `Call.LastView` and `Job.LastView`: the last fetched view, safe from any goroutine.
-- `Client.SubmitWith`, `Client.EnqueueWith` and `App.EnqueueWith` with `CallbackURL` (sent as `callback_url`; stored, delivery is planned).
+- `Client.SubmitWith`, `Client.EnqueueWith` and `App.EnqueueWith` with `CallbackURL` (sent as `callback_url`: Surfra POSTs the task's latest state there each time it changes).
+- `VerifyWebhook`, `VerifyWebhookAt` and `WebhookHandler` verify a callback's `X-Surfra-Signature` (HMAC-SHA256, 300 s tolerance, several secrets during rotation) and return the parsed `Callback`.
 
 ### Changed
 - `Call` and `Job` are safe to share across goroutines: `View` is written under a lock.

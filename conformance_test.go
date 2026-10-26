@@ -521,6 +521,35 @@ func TestConformance(t *testing.T) {
 				t.Fatalf("job ended %v", view)
 			}
 		},
+		"h01_callback_signatures": func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(suite(), "webhooks.json"))
+			if err != nil {
+				t.Skip("surfra-sdk-tests is not checked out")
+			}
+			var vectors struct {
+				Tolerance int64 `json:"tolerance_seconds"`
+				Cases     []struct {
+					Name, Secret, Signature, Body string
+					Now                           int64
+					OK                            bool
+				} `json:"cases"`
+			}
+			check(t, json.Unmarshal(data, &vectors))
+			if len(vectors.Cases) == 0 {
+				t.Fatal("no cases in webhooks.json")
+			}
+			for _, c := range vectors.Cases {
+				cb, err := VerifyWebhookAt([]byte(c.Body), c.Signature, time.Unix(c.Now, 0), time.Duration(vectors.Tolerance)*time.Second, c.Secret)
+				switch {
+				case c.OK && err != nil:
+					t.Errorf("%s: %v", c.Name, err)
+				case c.OK && cb.Seq != 7:
+					t.Errorf("%s: seq %d", c.Name, cb.Seq)
+				case !c.OK && err == nil:
+					t.Errorf("%s: accepted", c.Name)
+				}
+			}
+		},
 	}
 	for _, name := range keys(cases) {
 		t.Run(name, func(t *testing.T) {

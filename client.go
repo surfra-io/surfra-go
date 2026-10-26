@@ -78,7 +78,7 @@ func NewCall(c *Client, view map[string]any) *Call {
 
 // EnqueueOptions are optional settings for EnqueueWith.
 type EnqueueOptions struct {
-	// CallbackURL is sent as callback_url: Surfra stores it with the call; delivery is planned.
+	// CallbackURL is sent as callback_url: Surfra POSTs the task's latest state there each time it changes.
 	CallbackURL string
 }
 
@@ -105,7 +105,7 @@ const rateRetries = 5
 // SubmitOptions are optional settings for SubmitWith.
 type SubmitOptions struct {
 	Metadata map[string]any
-	// CallbackURL is sent as callback_url: Surfra stores it with the transaction; delivery is planned.
+	// CallbackURL is sent as callback_url: Surfra POSTs the task's latest state there each time it changes.
 	CallbackURL string
 }
 

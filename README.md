@@ -44,11 +44,26 @@ view, err := job.Wait(ctx, 10*time.Second)
 
 Bound waits with the context, such as `context.WithTimeout`.
 
-To be told when a call finishes, pass a callback URL. Surfra stores it with the call; delivery is planned.
+To be told when a call changes, pass a callback URL. Surfra POSTs the task's latest state there each time it changes.
 
 ```go
 call, err := client.EnqueueWith(ctx, "embed", input, surfra.EnqueueOptions{CallbackURL: "https://example.com/hook"})
 ```
+
+### Verify callbacks
+
+Each callback carries `X-Surfra-Signature`. `WebhookHandler` reads the body, checks the signature against
+your signing secrets (pass the old and the new one while rotating) and answers 401 when it does not match:
+
+```go
+secrets := []string{os.Getenv("SURFRA_WEBHOOK_SECRET")}
+http.Handle("/hook", surfra.WebhookHandler(secrets, func(w http.ResponseWriter, r *http.Request, cb *surfra.Callback) {
+	log.Printf("%s seq %d: task %s is %s", cb.Type, cb.Seq, cb.Task.ID, cb.Task.Status)
+	w.WriteHeader(http.StatusNoContent)
+}))
+```
+
+Elsewhere, call `surfra.VerifyWebhook(body, r.Header, secrets...)` with the exact raw body bytes.
 
 ## Goroutines and HTTP
 
