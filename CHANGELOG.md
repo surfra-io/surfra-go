@@ -3,13 +3,17 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are git tags (`vX.Y.Z`).
 
+## [v0.2.1] - 2026-10-26
+
+### Added
+- `VerifyWebhook`, `VerifyWebhookAt` and `WebhookHandler` verify a callback's `X-Surfra-Signature` (HMAC-SHA256, 300 s tolerance, several secrets during rotation) and return the parsed `Callback`.
+
 ## [v0.2.0] - 2026-10-25
 
 ### Added
 - `Settings.HTTPClient`, `Client.WithHTTPClient` and `Volume.WithHTTPClient` to send requests with your own `*http.Client`.
 - `Call.LastView` and `Job.LastView`: the last fetched view, safe from any goroutine.
 - `Client.SubmitWith`, `Client.EnqueueWith` and `App.EnqueueWith` with `CallbackURL` (sent as `callback_url`: Surfra POSTs the task's latest state there each time it changes).
-- `VerifyWebhook`, `VerifyWebhookAt` and `WebhookHandler` verify a callback's `X-Surfra-Signature` (HMAC-SHA256, 300 s tolerance, several secrets during rotation) and return the parsed `Callback`.
 
 ### Changed
 - `Call` and `Job` are safe to share across goroutines: `View` is written under a lock.
