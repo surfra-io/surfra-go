@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +12,10 @@ import (
 
 // Client is the control plane: call apps and run jobs. It holds no mutable state, so one Client is safe
 // to share across goroutines.
+// Version is this module's release, sent as Surfra-Client so the control plane can trace errors to a release.
+// Keep it equal to the next git tag (vX.Y.Z).
+const Version = "0.2.1"
+
 type Client struct {
 	settings Settings
 	http     *http.Client
@@ -30,6 +33,14 @@ func NewClientWith(s Settings) *Client {
 	return &Client{settings: s, http: h}
 }
 
+// WithRetry is a copy of this client whose requests are retried as p says, in place of Settings.Retry.
+// The original client is unchanged.
+func (c *Client) WithRetry(p RetryPolicy) *Client {
+	s := c.settings
+	s.Retry = p
+	return &Client{settings: s, http: c.http}
+}
+
 // WithHTTPClient is a copy of this client that sends every request with h, such as one with a proxy,
 // custom TLS or tracing. Per-request deadlines still come from ctx. The original client is unchanged.
 func (c *Client) WithHTTPClient(h *http.Client) *Client {
@@ -39,7 +50,7 @@ func (c *Client) WithHTTPClient(h *http.Client) *Client {
 }
 
 func (c *Client) call(ctx context.Context, method, route string, body any, dest any) error {
-	resp, err := do(ctx, c.http, c.settings, request{control: true, method: method, url: c.settings.Master + route, json: body})
+	resp, err := send(ctx, c.http, c.settings, request{control: true, method: method, url: c.settings.Master + route, json: body})
 	if err != nil {
 		return err
 	}
@@ -100,8 +111,6 @@ func (c *Client) EnqueueWith(ctx context.Context, app string, input any, opts En
 	return &Call{ID: id, View: view, client: c}, nil
 }
 
-const rateRetries = 5
-
 // SubmitOptions are optional settings for SubmitWith.
 type SubmitOptions struct {
 	Metadata map[string]any
@@ -109,7 +118,8 @@ type SubmitOptions struct {
 	CallbackURL string
 }
 
-// Submit starts a transaction. Over the organization's request rate, it waits as Surfra asks, up to five times.
+// Submit starts a transaction. Overload answers are retried as RetryPolicy says; a 504 or a connection lost
+// after sending is not, and returns an error matching ErrOutcomeUnknown: the transaction may be running.
 func (c *Client) Submit(ctx context.Context, stages []map[string]any, metadata map[string]any) (map[string]any, error) {
 	return c.SubmitWith(ctx, stages, SubmitOptions{Metadata: metadata})
 }
@@ -124,29 +134,8 @@ func (c *Client) SubmitWith(ctx context.Context, stages []map[string]any, opts S
 	if opts.CallbackURL != "" {
 		body["callback_url"] = opts.CallbackURL
 	}
-	for attempt := 0; ; attempt++ {
-		resp, err := send(ctx, c.http, c.settings, request{control: true, method: http.MethodPost, url: c.settings.Master + "/v1/transactions", json: body})
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode == http.StatusTooManyRequests && attempt < rateRetries {
-			resp.Body.Close()
-			wait, err := strconv.ParseFloat(resp.Header.Get("Retry-After"), 64)
-			if err != nil {
-				wait = 1
-			}
-			if err := sleep(ctx, time.Duration(max(1, min(60, wait))*float64(time.Second))); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if resp.StatusCode >= 300 {
-			defer resp.Body.Close()
-			return nil, errorFrom(resp)
-		}
-		var view map[string]any
-		return view, decode(resp, &view)
-	}
+	var view map[string]any
+	return view, c.call(ctx, http.MethodPost, "/v1/transactions", body, &view)
 }
 
 // App is a deployed app by name. No request is made until it is used.

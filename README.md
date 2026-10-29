@@ -83,6 +83,46 @@ The SDK's own client caps a control-plane request at 60 s and a volume request a
 (`Open`, and the downloads `Local` and `Download` make) under a ctx with a deadline is bounded by that
 deadline instead, so set one for very large files.
 
+## Errors and retries
+
+When Surfra can't take work right now, it refuses with a typed error and queues nothing, so every
+request retries it for you, after the `Retry-After` Surfra sends:
+
+| Status | `(*surfra.Error).Type` | Retried? |
+| --- | --- | --- |
+| 429 | `RATE_LIMITED`: your organization's per-minute limit | yes |
+| 503 | `QUEUE_FULL`: the app's queue is as long as its machines can clear soon | yes |
+| 503 | `SERVER_BUSY`: Surfra is short of database connections | yes |
+| 503 | `APP_PAUSED`, `DEFCON_ACTIVE`: the app is paused, or the kill switch is on | no |
+| 402 | `HTTP_CALLS_LIMIT`: this month's included HTTP calls are used up and the organization has no card on file. Add one in Settings, or wait for the month to turn | no |
+| 502/503/504 with no Surfra error | `""` | only reads (`GET`) |
+| a connection that never got through | `""` | yes |
+| other 4xx | | no |
+
+**Limits:** at most 7 retries (8 attempts) within 3 minutes of the first try, and never past `ctx`'s
+deadline. Without `Retry-After`, the waits back off exponentially with jitter (0.5 s base, 30 s cap).
+Change the limits per client, or per call through the context:
+
+```go
+client := surfra.NewClient().WithRetry(surfra.RetryPolicy{
+	MaxRetries: surfra.Retries(3),
+	Deadline:   30 * time.Second,
+	OnRetry:    func(e surfra.RetryEvent) { log.Printf("surfra: %s, retrying in %v", e.Reason, e.Wait) },
+})
+ctx = surfra.WithRetryPolicy(ctx, surfra.NoRetries())   // calls with this ctx are never retried
+```
+
+`Volume.WithRetry` works the same way, and `slog` gets a Debug record for every retry.
+
+**The final error:** `*surfra.Error` carries `Status`, `Type`, `Message`, `Attempts` and `RetryAfter`, and
+`Err` for a connection error (`Status` is 0 then).
+
+**When the outcome is unknown:** a submission (a transaction or a job) that got a 504, or lost its
+connection after it was sent, is never retried, because it may already be running.
+`errors.Is(err, surfra.ErrOutcomeUnknown)` is true for it.
+- Check for the work before submitting again.
+- For long work, prefer `Enqueue` then `Result`, or a callback URL, over one long call.
+
 ## Credentials
 
 Inside a Surfra app or job nothing needs setting: `SURFRA_VOLUMES_URL` is a local proxy that adds the

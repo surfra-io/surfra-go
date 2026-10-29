@@ -3,6 +3,7 @@ package surfra
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,6 +87,14 @@ func (v *Volume) WithHTTPClient(h *http.Client) *Volume {
 	return NewVolumeWith(v.Name, s)
 }
 
+// WithRetry is a new handle on the same volume whose requests are retried as p says, in place of
+// Settings.Retry. It starts with its own sync bookkeeping; the original is unchanged.
+func (v *Volume) WithRetry(p RetryPolicy) *Volume {
+	s := v.settings
+	s.Retry = p
+	return NewVolumeWith(v.Name, s)
+}
+
 // Grant is a grant such as "weights:r", for jobs and apps.
 func (v *Volume) Grant(mode Mode) string { return v.Name + ":" + string(mode) }
 
@@ -110,34 +119,18 @@ func (v *Volume) call(ctx context.Context, r request, create bool) (*http.Respon
 
 func (v *Volume) callWith(ctx context.Context, client *http.Client, r request, create bool) (*http.Response, error) {
 	resp, err := send(ctx, client, v.settings, r)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 300 {
-		failure := errorFrom(resp)
-		resp.Body.Close()
-		var apiErr *Error
-		if create && resp.StatusCode == http.StatusNotFound && asError(failure, &apiErr) && strings.Contains(apiErr.Detail, "no volume") {
-			if _, err := v.Create(ctx); err != nil {
-				return nil, err
-			}
-			return do(ctx, client, v.settings, r)
+	var apiErr *Error
+	if err != nil && create && errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound && strings.Contains(apiErr.Detail, "no volume") {
+		if _, err := v.Create(ctx); err != nil {
+			return nil, err
 		}
-		return nil, failure
+		return send(ctx, client, v.settings, r)
 	}
-	return resp, nil
-}
-
-func asError(err error, dest **Error) bool {
-	found, ok := err.(*Error)
-	if ok {
-		*dest = found
-	}
-	return ok
+	return resp, err
 }
 
 func (v *Volume) control(ctx context.Context, method, route string, body any) (map[string]any, error) {
-	resp, err := do(ctx, v.http, v.settings, request{control: true, method: method, url: v.settings.Master + route, json: body})
+	resp, err := send(ctx, v.http, v.settings, request{control: true, method: method, url: v.settings.Master + route, json: body})
 	if err != nil {
 		return nil, err
 	}
@@ -437,16 +430,13 @@ func (v *Volume) downloadTo(ctx context.Context, remote, target string) error {
 
 func (v *Volume) head(ctx context.Context, path string) ([]Entry, error) {
 	resp, err := send(ctx, v.http, v.settings, request{method: http.MethodHead, url: v.url("files/" + encodePath(path))})
+	if IsNotFound(err) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode >= 300 {
-		return nil, errorFrom(resp)
-	}
+	resp.Body.Close()
 	return []Entry{{Path: path, Size: resp.ContentLength, ETag: resp.Header.Get("ETag"), Modified: resp.Header.Get("Last-Modified")}}, nil
 }
 

@@ -9,12 +9,9 @@
 package surfra
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,6 +45,10 @@ type Settings struct {
 	// control plane, 30 min for volumes). Use it for proxies, custom TLS, tracing or your own timeouts.
 	// It is shared, so it must be safe for concurrent use, as *http.Client is.
 	HTTPClient *http.Client
+
+	// Retry limits how requests are retried; the zero value is Surfra's defaults (8 attempts within
+	// 3 minutes). See RetryPolicy.
+	Retry RetryPolicy
 }
 
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
@@ -150,38 +151,62 @@ func (s Settings) ControlCredential() (string, error) {
 	return s.Credential()
 }
 
-// Error is Surfra refusing a request: Status is the HTTP code, Detail the reason it gave.
+// Error is Surfra refusing a request, or a connection error, after the SDK's retries.
+//
+// Status is the HTTP code (0 for a connection error, whose cause is Err), Detail the reason Surfra gave,
+// Type Surfra's error.type (such as QUEUE_FULL, APP_PAUSED or HTTP_CALLS_LIMIT; "" when the answer had none), and Message
+// error.message (or Detail). Attempts counts the requests sent. RetryAfter is the wait Surfra asked for, if
+// any. OutcomeUnknown means a submission got a 504 or lost its connection after it was sent: the work may
+// be running, so check it before submitting again; errors.Is(err, ErrOutcomeUnknown) reports the same.
 type Error struct {
-	Status int
-	Detail string
+	Status         int
+	Detail         string
+	Type           string
+	Message        string
+	Attempts       int
+	RetryAfter     time.Duration
+	OutcomeUnknown bool
+	Err            error
+
+	retryable     bool
+	hasRetryAfter bool
 }
 
-func (e *Error) Error() string { return fmt.Sprintf("%d: %s", e.Status, e.Detail) }
+func (e *Error) Error() string {
+	text := e.reason() + ": " + e.Detail
+	if e.Status == 0 {
+		text = e.Detail
+	}
+	if e.Attempts > 1 {
+		text += " (after " + strconv.Itoa(e.Attempts) + " attempts)"
+	}
+	if e.OutcomeUnknown {
+		text += "; outcome unknown: the submission may be running, check it before submitting again"
+	}
+	return text
+}
+
+// reason is the status and type, such as "503 QUEUE_FULL", or the connection error's cause.
+func (e *Error) reason() string {
+	switch {
+	case e.Status == 0:
+		return e.Detail
+	case e.Type != "":
+		return strconv.Itoa(e.Status) + " " + e.Type
+	}
+	return strconv.Itoa(e.Status)
+}
+
+// Unwrap is the connection error behind a Status 0 Error.
+func (e *Error) Unwrap() error { return e.Err }
+
+// Is matches ErrOutcomeUnknown when the outcome is unknown.
+func (e *Error) Is(target error) bool { return target == ErrOutcomeUnknown && e.OutcomeUnknown }
 
 // IsNotFound reports whether err is Surfra answering 404.
 func IsNotFound(err error) bool {
 	var apiErr *Error
 	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
-}
-
-func errorFrom(resp *http.Response) error {
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	detail := strings.TrimSpace(string(data))
-	var body struct {
-		Error  *string `json:"error"`
-		Detail *string `json:"detail"`
-	}
-	if json.Unmarshal(data, &body) == nil {
-		if body.Error != nil {
-			detail = *body.Error
-		} else if body.Detail != nil {
-			detail = *body.Detail
-		}
-	}
-	if detail == "" {
-		detail = http.StatusText(resp.StatusCode)
-	}
-	return &Error{Status: resp.StatusCode, Detail: detail}
 }
 
 type request struct {
@@ -192,60 +217,6 @@ type request struct {
 	json    any
 	query   url.Values
 	header  http.Header
-}
-
-func send(ctx context.Context, client *http.Client, s Settings, r request) (*http.Response, error) {
-	credential := s.Credential
-	if r.control {
-		credential = s.ControlCredential
-	}
-	token, err := credential()
-	if err != nil {
-		return nil, err
-	}
-	target := r.url
-	if len(r.query) > 0 {
-		target += "?" + r.query.Encode()
-	}
-	var reader io.Reader
-	body := r.body
-	if r.json != nil {
-		body, err = json.Marshal(r.json)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, r.method, target, reader)
-	if err != nil {
-		return nil, err
-	}
-	for key, values := range r.header {
-		req.Header[key] = values
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	if r.json != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if body != nil {
-		req.ContentLength = int64(len(body))
-	}
-	return client.Do(req)
-}
-
-// do sends a request and turns a non-success answer into *Error.
-func do(ctx context.Context, client *http.Client, s Settings, r request) (*http.Response, error) {
-	resp, err := send(ctx, client, s, r)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		return nil, errorFrom(resp)
-	}
-	return resp, nil
 }
 
 func decode(resp *http.Response, dest any) error {

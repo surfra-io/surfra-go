@@ -252,3 +252,18 @@ func TestCredentialFileIsCachedAndRereadOnChange(t *testing.T) {
 		t.Fatal("expected fallback after the token file was removed")
 	}
 }
+
+func TestEveryRequestNamesTheModuleAndItsVersion(t *testing.T) {
+	var got atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Store(r.Header.Get("Surfra-Client"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"tx_1","status":"queued","stages":[]}`))
+	}))
+	defer server.Close()
+	_, err := NewClientWith(Settings{Master: server.URL, APIKey: "sfk_test"}).Enqueue(context.Background(), "embed", nil)
+	check(t, err)
+	if got.Load() != "surfra-go/"+Version {
+		t.Fatalf("Surfra-Client = %v", got.Load())
+	}
+}
