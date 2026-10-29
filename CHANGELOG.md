@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are git tags (`vX.Y.Z`).
 
-## [Unreleased]
+## [v0.3.0] - 2026-10-29
 
 ### Added
 - Every request sends `Surfra-Client: surfra-go/<version>`, so the control plane can trace errors to a release.

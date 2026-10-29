@@ -14,7 +14,7 @@ import (
 // to share across goroutines.
 // Version is this module's release, sent as Surfra-Client so the control plane can trace errors to a release.
 // Keep it equal to the next git tag (vX.Y.Z).
-const Version = "0.2.1"
+const Version = "0.3.0"
 
 type Client struct {
 	settings Settings
